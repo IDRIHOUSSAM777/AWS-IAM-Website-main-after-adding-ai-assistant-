@@ -10,37 +10,18 @@ export type QuizQuestion = {
 }
 
 export type QuizState = {
-  name: string
   questions: QuizQuestion[]
   answered: number
   score: number
   total: number
 }
 
-export type AnswerResult = {
+type AnswerResult = {
   question: QuizQuestion
   alreadyAnswered: boolean
   score: number
   answered: number
   total: number
-}
-
-export type BoardEntry = {
-  rank: number | null
-  name: string
-  score: number
-  answered: number
-  isYou: boolean
-}
-
-export type BoardPeriod = 'all' | 'week' | 'month' | 'year'
-
-export type Board = {
-  entries: BoardEntry[]
-  me: BoardEntry | null
-  players: number
-  total: number
-  period: BoardPeriod
 }
 
 export class QuizApiError extends Error {
@@ -74,20 +55,19 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return data as T
 }
 
-export const fetchQuiz = () => request<QuizState>('/api/quiz')
-export const fetchBoard = (period: BoardPeriod = 'all') =>
-  request<Board>(`/api/leaderboard?period=${period}`)
+let quizRequest: Promise<QuizState> | null = null
+export function fetchQuiz() {
+  if (!quizRequest) {
+    quizRequest = request<QuizState>('/api/quiz').finally(() => {
+      quizRequest = null
+    })
+  }
+  return quizRequest
+}
+
 export const submitAnswer = (slot: number, choice: number) =>
   request<AnswerResult>('/api/quiz/answer', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ slot, choice }),
   })
-
-const EVENT = 'quiz:updated'
-/** Tells the quiz and the leaderboard that a new answer was saved. */
-export const announceQuizChange = () => window.dispatchEvent(new Event(EVENT))
-export function onQuizChange(listener: () => void) {
-  window.addEventListener(EVENT, listener)
-  return () => window.removeEventListener(EVENT, listener)
-}

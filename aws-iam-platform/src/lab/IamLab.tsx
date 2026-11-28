@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState, type CSSProperties } from 'react'
-import { CheckCircle2, Lightbulb, Play, RotateCcw, ShieldCheck, Sparkles, X } from 'lucide-react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import { ArrowLeft, CheckCircle2, Lightbulb, Play, RotateCcw, ShieldCheck, Sparkles } from 'lucide-react'
 import './lab.css'
 
-type Mode = 'closed' | 'missions' | 'sandbox'
+type Mode = 'missions' | 'sandbox'
 type FlowPhase = 'idle' | 'identity' | 'iam' | 'result'
 type Verdict = { decision: 'ALLOW' | 'DENY'; reason: string }
 
@@ -75,13 +76,10 @@ function initials(name: string) {
   return (clean.slice(0, 2) || '?').toUpperCase()
 }
 
-interface IamLabProps {
-  mode: Mode
-  onClose: () => void
-  onSwitchMode: (mode: Exclude<Mode, 'closed'>) => void
-}
-
-export default function IamLab({ mode, onClose, onSwitchMode }: IamLabProps) {
+export default function IamLab() {
+  const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const mode: Mode = searchParams.get('mode') === 'sandbox' ? 'sandbox' : 'missions'
   const [state, setState] = useState<SimState>(INITIAL_STATE)
   const [newUser, setNewUser] = useState('')
   const [selectedGroup, setSelectedGroup] = useState('Developers')
@@ -100,7 +98,6 @@ export default function IamLab({ mode, onClose, onSwitchMode }: IamLabProps) {
   const celebrateTimer = useRef(0)
   const previousCompleted = useRef<number[]>([])
   const simRef = useRef<HTMLElement>(null)
-  const dialogRef = useRef<HTMLDivElement>(null)
   const [confetti] = useState(() =>
     Array.from({ length: 26 }, (_, index) => ({
       left: Math.random() * 100,
@@ -111,6 +108,10 @@ export default function IamLab({ mode, onClose, onSwitchMode }: IamLabProps) {
     })),
   )
 
+  useEffect(() => {
+    window.scrollTo(0, 0)
+  }, [])
+
   const completedMissions = MISSIONS.filter((mission) => mission.check(state))
   const completedIds = completedMissions.map((mission) => mission.id)
   const completedKey = completedIds.join(',')
@@ -118,23 +119,13 @@ export default function IamLab({ mode, onClose, onSwitchMode }: IamLabProps) {
   const activeMission = MISSIONS.find((mission) => !completedIds.includes(mission.id)) ?? null
 
   useEffect(() => {
-    const previousOverflow = document.body.style.overflow
-    document.body.style.overflow = 'hidden'
-    dialogRef.current?.focus()
-    return () => {
-      document.body.style.overflow = previousOverflow
-    }
-  }, [])
-
-  useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return
-      event.stopImmediatePropagation()
-      onClose()
+      navigate('/')
     }
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
-  }, [onClose])
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [navigate])
 
   useEffect(() => {
     const ids = completedKey ? completedKey.split(',').map(Number) : []
@@ -298,12 +289,10 @@ export default function IamLab({ mode, onClose, onSwitchMode }: IamLabProps) {
     previousCompleted.current = []
   }
 
-  function switchMode(next: Exclude<Mode, 'closed'>) {
+  function switchMode(next: Mode) {
     resetFlow()
-    onSwitchMode(next)
+    setSearchParams({ mode: next })
   }
-
-  if (mode === 'closed') return null
 
   const doneCount = completedMissions.length
   const simName = simPrincipal.slice(5)
@@ -329,16 +318,8 @@ export default function IamLab({ mode, onClose, onSwitchMode }: IamLabProps) {
   const verdict = tested
 
   return (
-    <div
-      ref={dialogRef}
-      tabIndex={-1}
-      className="lab-backdrop"
-      role="dialog"
-      aria-modal="true"
-      aria-label="IAM Lab simulation"
-      onClick={(event) => { if (event.target === event.currentTarget) onClose() }}
-    >
-      <div className="lab-modal">
+    <main className="lab-page" aria-label="IAM Lab simulation">
+      <div className="lab-shell">
         <header className="lab-head">
           <div className="lab-brand">
             <span className="lab-logo" aria-hidden="true">&gt;_</span>
@@ -359,8 +340,8 @@ export default function IamLab({ mode, onClose, onSwitchMode }: IamLabProps) {
             <button type="button" className="lab-icon-btn" onClick={resetAll} title="Reset simulation" aria-label="Reset simulation">
               <RotateCcw size={15} />
             </button>
-            <button type="button" className="lab-icon-btn" onClick={onClose} title="Exit lab" aria-label="Exit lab">
-              <X size={17} />
+            <button type="button" className="lab-icon-btn" onClick={() => navigate('/')} title="Back to site" aria-label="Back to site">
+              <ArrowLeft size={17} />
             </button>
           </div>
         </header>
@@ -679,6 +660,6 @@ export default function IamLab({ mode, onClose, onSwitchMode }: IamLabProps) {
           ))}
         </div>
       )}
-    </div>
+    </main>
   )
 }

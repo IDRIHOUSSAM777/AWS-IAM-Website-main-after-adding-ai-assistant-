@@ -1,5 +1,5 @@
-/* IAM Lab — bright practice overlay. Scoped to .lab-backdrop so it cannot leak into the page. */
-.lab-backdrop {
+/* IAM Lab full-page workspace. Styles are scoped to .lab-page. */
+.lab-page {
   --lab-panel: #101d2b;
   --lab-panel-2: #0b1621;
   --lab-line: rgba(148, 190, 235, .17);
@@ -9,29 +9,21 @@
   --lab-pink: #f472b6;
   --lab-tx: #eef6ff;
   --lab-mu: #9db0c6;
-  position: fixed;
-  inset: 0;
-  z-index: 90;
-  display: grid;
-  place-items: center;
-  padding: 20px;
-  overflow-y: auto;
+  min-height: 100vh;
+  padding: 24px;
   background:
     radial-gradient(60% 50% at 50% 0%, rgba(255, 153, 0, .18), transparent 70%),
     radial-gradient(50% 50% at 100% 100%, rgba(56, 189, 248, .12), transparent 70%),
-    rgba(3, 8, 15, .84);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
+    #03080f;
+  color: var(--lab-tx);
 }
 
-.lab-backdrop:focus { outline: none; }
-
-.lab-modal {
+.lab-shell {
   position: relative;
-  width: min(1120px, 100%);
-  max-height: 92vh;
-  overflow-y: auto;
-  padding: 22px;
+  width: min(1500px, 100%);
+  min-height: calc(100vh - 48px);
+  margin: 0 auto;
+  padding: clamp(20px, 3vw, 44px);
   border: 1px solid rgba(255, 180, 70, .28);
   border-radius: 16px;
   background:
@@ -40,12 +32,7 @@
     linear-gradient(180deg, #101c29, #0b1420);
   box-shadow: 0 40px 100px rgba(0, 0, 0, .6), inset 0 1px 0 rgba(255, 255, 255, .07);
   color: var(--lab-tx);
-  scrollbar-width: thin;
-  scrollbar-color: #3a4a5f transparent;
-  animation: lab-modal-in .28s cubic-bezier(.2, .8, .2, 1) both;
 }
-.lab-modal::-webkit-scrollbar { width: 8px; }
-.lab-modal::-webkit-scrollbar-thumb { border-radius: 99px; background: #3a4a5f; }
 
 /* ---------- Header ---------- */
 .lab-head { display: flex; align-items: center; gap: 16px; }
@@ -513,7 +500,6 @@
   animation: lab-fall var(--dur) cubic-bezier(.2, .6, .4, 1) var(--d) forwards;
 }
 
-@keyframes lab-modal-in { from { opacity: 0; transform: translateY(14px) scale(.985); } to { opacity: 1; transform: none; } }
 @keyframes lab-pop { from { opacity: 0; transform: scale(.92); } to { opacity: 1; transform: none; } }
 @keyframes lab-row-in { from { opacity: 0; transform: translateX(-8px); } to { opacity: 1; transform: none; } }
 @keyframes lab-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(255, 176, 32, .0); } 50% { box-shadow: 0 0 0 4px rgba(255, 176, 32, .12); } }
@@ -527,8 +513,8 @@
 }
 
 @media (max-width: 720px) {
-  .lab-backdrop { padding: 0; align-items: start; }
-  .lab-modal { max-height: none; min-height: 100vh; border-radius: 0; padding: 16px; border-right: 0; border-left: 0; }
+  .lab-page { padding: 0; }
+  .lab-shell { width: 100%; min-height: 100vh; border-radius: 0; padding: 16px; border-right: 0; border-left: 0; }
   .lab-head { flex-wrap: wrap; gap: 10px; }
   .lab-switch { order: 3; width: 100%; margin-left: 0; }
   .lab-switch button { flex: 1; }
@@ -543,7 +529,7 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .lab-modal, .lab-mission-num, .lab-user, .lab-chip, .lab-policy, .lab-verdict,
+  .lab-mission-num, .lab-user, .lab-chip, .lab-policy, .lab-verdict,
   .lab-toast, .lab-confetti i, .lab-wire { animation: none; }
   .lab-packet, .lab-progress-track i, .lab-btn, .lab-mfa, .lab-mfa::after { transition: none; }
 }
