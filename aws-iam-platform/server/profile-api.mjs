@@ -2,13 +2,14 @@ import { randomUUID } from 'node:crypto'
 import mysql from 'mysql2/promise'
 
 const ENDPOINT = '/api/profile'
+export const ANONYMOUS_DISPLAY_NAME = 'Learner'
 
 // Keep letters, marks (accents, Arabic diacritics), numbers, spaces, - and apostrophes.
 // The name ends up inside an AI prompt, so nothing else is allowed.
 export function cleanName(raw) {
   return String(raw ?? '')
     .normalize('NFKC')
-    .replace(/[^\p{L}\p{M}\p{N} '’\-]/gu, '')
+    .replace(/[^\p{L}\p{M}\p{N} '’-]/gu, '')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 30)
@@ -94,7 +95,8 @@ export function createProfileApi(getConfig = dbConfigFromEnv) {
   // Used by KYUBI. It must never break the chat, so any database problem simply means "no name".
   async function getVisitorName(req) {
     try {
-      return await findName(visitorIdFrom(req))
+      const name = await findName(visitorIdFrom(req))
+      return name === ANONYMOUS_DISPLAY_NAME ? null : name
     } catch (error) {
       console.error('[profile-api] could not read the visitor name for Kyubi:', error?.code ?? '', error?.message ?? error)
       return null

@@ -244,6 +244,7 @@ pre { margin: 0; background: var(--code); border: 1px solid var(--line); padding
 .rules { margin: 16px 0 0; padding-left: 18px; color: var(--mu); font-size: 12px; }
 .lab { text-align: left; padding-bottom: 90px; }
 .lab .lab-title { font: 600 clamp(30px, 6vw, 52px)/1.1 "Pixelify Sans", "JetBrains Mono", monospace; color: var(--or); margin: 0 0 12px; }
+.lab #start-mission { scroll-margin-top: 84px; }
 .lab ol { margin: 14px 0 22px; padding: 0; list-style: none; display: grid; gap: 8px; font-size: 13px; }
 .lab li span { color: var(--or); margin-right: 10px; font-weight: 600; }
 .btn { font: inherit; font-weight: 800; font-size: 13px; background: var(--or); color: #141c28; border: 0; padding: 12px 20px; cursor: pointer; border-radius: 2px; }

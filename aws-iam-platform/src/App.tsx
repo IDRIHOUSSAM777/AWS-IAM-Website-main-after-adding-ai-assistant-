@@ -1,14 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { MonitorPlay } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import awsLogo from './assets/aws-logo.png'
 import './App.css'
 import HeroStage from './HeroStage'
 import NovaShopDemo from './NovaShopDemo'
 import Quiz from './quiz/Quiz'
-import Leaderboard from './quiz/Leaderboard'
-import IamLab from './lab/IamLab'
 import Kyubi from './kyubi/Kyubi'
-import WelcomeBack from './profile/WelcomeBack'
 
 const identities = {
   sara: {
@@ -78,7 +76,6 @@ function App() {
   const [deny, setDeny] = useState(false)
   const [activeSection, setActiveSection] = useState(0)
   const [reducedMotion] = useState(() => window.matchMedia('(prefers-reduced-motion: reduce)').matches)
-  const [labMode, setLabMode] = useState<'closed' | 'missions' | 'sandbox'>('closed')
   const barRef = useRef<HTMLElement>(null)
   const selected = identities[identity]
   const allowed = allow && !deny
@@ -133,16 +130,13 @@ function App() {
           <a className={activeSection === 1 ? 'on' : ''} aria-current={activeSection === 1 ? 'true' : undefined} href="#what-is-iam">What is IAM</a>
           <a className={activeSection === 2 ? 'on' : ''} aria-current={activeSection === 2 ? 'true' : undefined} href="#why-iam">Why</a>
           <a className={activeSection === 3 ? 'on' : ''} aria-current={activeSection === 3 ? 'true' : undefined} href="#how-it-works">How</a>
-          <a className={`lab-nav-link ${activeSection === 4 ? 'on' : ''}`} aria-current={activeSection === 4 ? 'true' : undefined} href="#lab"><MonitorPlay size={14} aria-hidden="true" />IAM Lab</a>
+          <Link className={`lab-nav-link ${activeSection === 4 ? 'on' : ''}`} to="/lab?mode=missions"><MonitorPlay size={14} aria-hidden="true" />IAM Lab</Link>
         </nav>
-        <a className="pill" href="#what-is-iam">Read more</a>
+        <a className="pill" href="/iam">Read more</a>
       </div>
     </header>
 
-    <Leaderboard />
-
     <section className="w" aria-label="AWS Student Builder">
-      <WelcomeBack />
       <HeroStage />
     </section>
 
@@ -295,25 +289,18 @@ function App() {
             <p className="t">Guided missions</p><h3>Follow the steps</h3>
             <p className="mu">Short tasks with hints and a check at the end of each one.</p>
             <ol><li><span>Mission 1</span>Create a user and turn on MFA</li><li><span>Mission 2</span>Add users to a group and attach a policy</li><li><span>Mission 3</span>Let a Lambda function use a role</li></ol>
-            <button className="btn" type="button" onClick={() => setLabMode('missions')}>Start missions</button>
+            <Link className="btn" to="/lab?mode=missions">Start missions</Link>
           </div>
           <div className="c">
             <p className="t">Free sandbox</p><h3>Build your own</h3>
             <p className="mu">Create users, groups, roles, and policies in any order. Send access requests and see if IAM allows or denies them.</p>
             <ol><li><span>Try</span>Break a policy on purpose</li><li><span>Try</span>Add an explicit Deny and see it win</li><li><span>Try</span>Shrink a broad policy to least privilege</li></ol>
-            <button className="btn alt" type="button" onClick={() => setLabMode('sandbox')}>Open sandbox</button>
+            <Link className="btn alt" to="/lab?mode=sandbox">Open sandbox</Link>
           </div>
         </div>
       </section>
       <footer className="w">AWS Student Builder. Learn, build, growth.</footer>
       </div>
-      {labMode !== 'closed' && (
-        <IamLab
-          mode={labMode}
-          onClose={() => setLabMode('closed')}
-          onSwitchMode={(mode) => setLabMode(mode)}
-        />
-      )}
       <Kyubi />
     </>
   )

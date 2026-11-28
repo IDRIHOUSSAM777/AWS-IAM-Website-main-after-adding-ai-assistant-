@@ -1,14 +1,11 @@
 import { useCallback, useEffect, useState } from 'react'
 import { ChevronLeft, ChevronRight } from 'lucide-react'
-import { useProfile } from '../profile/profileContext'
-import { announceQuizChange, fetchQuiz, QuizApiError, submitAnswer, type QuizQuestion, type QuizState } from './quizApi'
-import { openLeaderboard } from './leaderboardBus'
+import { fetchQuiz, QuizApiError, submitAnswer, type QuizQuestion, type QuizState } from './quizApi'
 import './quiz.css'
 
 const PER_PAGE = 3
 
 export default function Quiz() {
-  const { name, clear } = useProfile()
   const [state, setState] = useState<QuizState | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
@@ -34,9 +31,27 @@ export default function Quiz() {
   }, [])
 
   useEffect(() => {
-    if (name) void load()
-    else setLoading(false)
-  }, [name, load])
+    let active = true
+    void fetchQuiz().then(
+      (data) => {
+        if (!active) return
+        setState(data)
+        setError(null)
+        const firstOpen = data.questions.findIndex((q) => !q.answered)
+        setPage(firstOpen === -1 ? 0 : Math.floor(firstOpen / PER_PAGE))
+        setLoading(false)
+      },
+      (caught) => {
+        if (!active) return
+        setState(null)
+        setError(caught instanceof QuizApiError ? caught.message : 'Something went wrong on our side. Please try again in a moment.')
+        setLoading(false)
+      },
+    )
+    return () => {
+      active = false
+    }
+  }, [])
 
   async function handleSubmit(question: QuizQuestion) {
     const choice = picked[question.slot]
@@ -55,7 +70,6 @@ export default function Quiz() {
             }
           : current,
       )
-      announceQuizChange()
     } catch (caught) {
       setNotice((current) => ({
         ...current,
@@ -64,19 +78,6 @@ export default function Quiz() {
     } finally {
       setSending(null)
     }
-  }
-
-  if (!name) {
-    return (
-      <div className="qz" id="check-yourself">
-        <h4>Check yourself</h4>
-        <div className="qz-panel qz-center">
-          <p className="qz-big">Your score needs a name.</p>
-          <p className="mu">Tell us how to call you, and your answers will be kept with your name.</p>
-          <button className="btn" type="button" onClick={() => void clear().catch(() => undefined)}>Choose a name</button>
-        </div>
-      </div>
-    )
   }
 
   if (loading) {
@@ -178,7 +179,7 @@ export default function Quiz() {
 
         {finished ? (
           <p className="qz-done">
-            You finished all {state.total} questions with {state.score} correct. <button className="qz-link" type="button" onClick={openLeaderboard}>See the leaderboard</button>.
+            You finished all {state.total} questions with {state.score} correct.
           </p>
         ) : null}
       </div>

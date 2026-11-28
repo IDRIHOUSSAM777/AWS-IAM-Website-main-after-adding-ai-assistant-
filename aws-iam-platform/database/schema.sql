@@ -8,7 +8,7 @@ CREATE DATABASE IF NOT EXISTS aws_iam_platform
 
 CREATE TABLE IF NOT EXISTS aws_iam_platform.visitors (
   id           CHAR(36)     NOT NULL,                              -- random id kept in the visitor_id cookie
-  display_name VARCHAR(30)  NOT NULL,                              -- the name or nickname typed on the landing page
+  display_name VARCHAR(30)  NOT NULL,                              -- legacy profile name or generic anonymous quiz label
   created_at   TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
   last_seen_at TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),

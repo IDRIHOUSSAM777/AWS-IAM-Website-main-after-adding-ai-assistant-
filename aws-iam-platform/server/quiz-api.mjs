@@ -1,20 +1,11 @@
+import { randomUUID } from 'node:crypto'
 import { QUIZ_BANK, QUIZ_SIZE } from './quiz-bank.mjs'
-import { getSharedPool, getVisitorId } from './profile-api.mjs'
+import { ANONYMOUS_DISPLAY_NAME, getSharedPool, getVisitorId } from './profile-api.mjs'
 
 const BY_KEY = new Map(QUIZ_BANK.map((item) => [item.key, item]))
 
 const QUIZ_PATH = '/api/quiz'
 const ANSWER_PATH = '/api/quiz/answer'
-const BOARD_PATH = '/api/leaderboard'
-
-const BOARD_PERIODS = new Set(['all', 'week', 'month', 'year'])
-// Fixed SQL fragments (never built from user input): the board can be filtered to this
-// calendar week, month or year. "all" keeps every answer ever saved.
-const PERIOD_FILTERS = {
-  week: " AND a.answered_at >= DATE_SUB(CURDATE(), INTERVAL WEEKDAY(CURDATE()) DAY)",
-  month: " AND a.answered_at >= DATE_FORMAT(CURDATE(), '%Y-%m-01')",
-  year: ' AND a.answered_at >= MAKEDATE(YEAR(CURDATE()), 1)',
-}
 
 /** Fisher-Yates shuffle on a copy. `rand` can be replaced in tests. */
 export function shuffle(list, rand = Math.random) {
@@ -62,11 +53,12 @@ export function toPublicQuestion(row) {
   }
 }
 
-function send(res, status, body) {
+function send(res, status, body, headers = {}) {
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
+    ...headers,
   })
   res.end(JSON.stringify(body))
 }
@@ -101,10 +93,10 @@ const DB_CODES = [
 ]
 
 /**
- * @param {{ getPool?: () => import('mysql2/promise').Pool, visitorIdFrom?: (req: any) => string | null }} deps
+ * @param {{ getPool?: () => import('mysql2/promise').Pool, visitorIdFrom?: (req: any) => string | null, createVisitorId?: () => string }} deps
  * Both default to the shared database connection of the profile API.
  */
-export function createQuizApi({ getPool = getSharedPool, visitorIdFrom = getVisitorId } = {}) {
+export function createQuizApi({ getPool = getSharedPool, visitorIdFrom = getVisitorId, createVisitorId = randomUUID } = {}) {
   async function findVisitor(id) {
     if (!id) return null
     const [rows] = await getPool().execute('SELECT display_name FROM visitors WHERE id = ?', [id])
@@ -142,61 +134,36 @@ export function createQuizApi({ getPool = getSharedPool, visitorIdFrom = getVisi
     return { questions, answered, score, total: questions.length }
   }
 
-  async function leaderboard(visitor, period = 'all') {
-    const [rows] = await getPool().query(
-      `SELECT v.id, v.display_name,
-              COUNT(CASE WHEN a.is_correct = 1 THEN 1 END) AS score,
-              COUNT(a.answered_at) AS answered,
-              MAX(a.answered_at) AS last_at
-         FROM visitors v
-         JOIN quiz_assignments a ON a.visitor_id = v.id
-        WHERE a.answered_at IS NOT NULL${PERIOD_FILTERS[period] ?? ''}
-        GROUP BY v.id, v.display_name
-        ORDER BY score DESC, answered ASC, last_at ASC
-        LIMIT 200`,
-    )
-    const entries = rows.map((row, index) => ({
-      rank: index + 1,
-      name: row.display_name,
-      score: Number(row.score),
-      answered: Number(row.answered),
-      isYou: Boolean(visitor) && row.id === visitor.id,
-    }))
-    let me = entries.find((entry) => entry.isYou) ?? null
-    if (!me && visitor) me = { rank: null, name: visitor.name, score: 0, answered: 0, isYou: true }
-    return { entries, me, players: entries.length, total: QUIZ_SIZE, period }
-  }
-
   async function handler(req, res, next) {
     const path = (req.url ?? '').split('?')[0]
-    if (path !== QUIZ_PATH && path !== ANSWER_PATH && path !== BOARD_PATH) {
+    if (path !== QUIZ_PATH && path !== ANSWER_PATH) {
       if (typeof next === 'function') return next()
       return send(res, 404, { error: 'Not found.' })
     }
 
     try {
-      const visitor = await findVisitor(visitorIdFrom(req))
+      if (path === QUIZ_PATH && req.method !== 'GET') return send(res, 405, { error: 'Method not allowed.' })
+      if (path === ANSWER_PATH && req.method !== 'POST') return send(res, 405, { error: 'Method not allowed.' })
+      if (path === ANSWER_PATH && !sameOrigin(req)) return send(res, 403, { error: 'This request is not allowed.' })
 
-      if (path === BOARD_PATH) {
-        if (req.method !== 'GET') return send(res, 405, { error: 'Method not allowed.' })
-        const period = new URL(req.url ?? '/', 'http://localhost').searchParams.get('period') ?? 'all'
-        if (!BOARD_PERIODS.has(period)) return send(res, 400, { error: 'Unknown leaderboard period.' })
-        return send(res, 200, await leaderboard(visitor, period))
-      }
-
+      let visitor = await findVisitor(visitorIdFrom(req))
+      let cookie = ''
       if (!visitor) {
-        return send(res, 401, { error: 'Please choose a name first, so we can keep your score.' })
+        const id = createVisitorId()
+        await getPool().execute(
+          'INSERT INTO visitors (id, display_name) VALUES (?, ?)',
+          [id, ANONYMOUS_DISPLAY_NAME],
+        )
+        visitor = { id, name: ANONYMOUS_DISPLAY_NAME }
+        cookie = `visitor_id=${id}; HttpOnly; SameSite=Lax; Path=/; Max-Age=31536000`
       }
 
       if (path === QUIZ_PATH) {
-        if (req.method !== 'GET') return send(res, 405, { error: 'Method not allowed.' })
         const summary = summarize(await ensureAssignments(visitor.id))
-        return send(res, 200, { name: visitor.name, ...summary })
+        return send(res, 200, summary, cookie ? { 'Set-Cookie': cookie } : {})
       }
 
       // ANSWER_PATH
-      if (req.method !== 'POST') return send(res, 405, { error: 'Method not allowed.' })
-      if (!sameOrigin(req)) return send(res, 403, { error: 'This request is not allowed.' })
       let body
       try { body = await readJson(req) } catch { return send(res, 400, { error: 'Your answer could not be read.' }) }
       const slot = Number(body?.slot)
@@ -229,7 +196,7 @@ export function createQuizApi({ getPool = getSharedPool, visitorIdFrom = getVisi
 
       const summary = summarize(await loadRows(visitor.id))
       const question = summary.questions.find((q) => q.slot === slot)
-      return send(res, 200, { question, alreadyAnswered, score: summary.score, answered: summary.answered, total: summary.total })
+      return send(res, 200, { question, alreadyAnswered, score: summary.score, answered: summary.answered, total: summary.total }, cookie ? { 'Set-Cookie': cookie } : {})
     } catch (error) {
       console.error('[quiz-api]', error?.code ?? '', error?.message ?? error)
       if (DB_CODES.includes(error?.code)) return send(res, 503, { error: UNAVAILABLE })

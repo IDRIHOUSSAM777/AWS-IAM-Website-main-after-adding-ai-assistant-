@@ -1,4 +1,4 @@
-/* Quiz and leaderboard. Uses the site's variables (--panel, --line, --or, --bl, --mu, --rd). */
+/* Quiz. Uses the site's variables (--panel, --line, --or, --bl, --mu, --rd). */
 .av {
   display: inline-grid;
   place-items: center;
@@ -97,18 +97,6 @@
 .qz-dots button { width: 9px; height: 9px; padding: 0; border: 0; border-radius: 50%; background: rgba(255, 255, 255, .4); cursor: pointer; transition: all .15s ease; }
 .qz-dots button.on { width: 12px; height: 12px; background: #fff; }
 .qz-done { margin: 18px 0 0; padding: 14px 16px; border: 1px dashed var(--or); border-radius: 4px; font-size: 14px; }
-.qz-link {
-  padding: 0;
-  border: 0;
-  background: none;
-  color: var(--or);
-  font: inherit;
-  text-decoration: underline;
-  text-underline-offset: 3px;
-  cursor: pointer;
-}
-.qz-link:hover { color: #ffb84d; }
-
 /* ---------- Leaderboard dock (top-right, show / hide) ---------- */
 .lb-dock { position: fixed; inset: 0 0 0 auto; z-index: 70; pointer-events: none; }
 
