@@ -1,127 +1,226 @@
 import { useEffect, useRef, useState, type CSSProperties } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, CheckCircle2, Lightbulb, Play, RotateCcw, ShieldCheck, Sparkles } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
+import { ArrowLeft, Box, CheckCircle2, FlaskConical, KeyRound, Minus, Play, RotateCcw, ScrollText, ShieldCheck, Trash2, Users, UserRound, X } from 'lucide-react'
 import './lab.css'
 
-type Mode = 'missions' | 'sandbox'
+type View = 'users' | 'groups' | 'roles' | 'policies' | 'services' | 'test'
+type ServiceType = 's3' | 'dynamodb' | 'lambda' | 'ec2'
+type Effect = 'Allow' | 'Deny'
 type FlowPhase = 'idle' | 'identity' | 'iam' | 'result'
-type Verdict = { decision: 'ALLOW' | 'DENY'; reason: string }
 
-interface SimState {
-  users: string[]
-  mfaUsers: string[]
-  groups: Record<string, string[]>
-  policies: Record<string, { effect: 'Allow' | 'Deny'; action: string; resource: string }>
-  attachedGroupPolicies: Record<string, string[]>
-  roles: Record<string, { trust: string; policy: string | null }>
+interface User { name: string; mfa: boolean; mustReset: boolean; policies: string[] }
+interface Group { name: string; members: string[]; policies: string[] }
+interface Role { name: string; trust: string; policies: string[] }
+interface Policy { name: string; effect: Effect; actions: string[]; resources: string[]; needsMfa: boolean }
+interface Resource { type: ServiceType; name: string }
+interface Sim { users: User[]; groups: Group[]; roles: Role[]; policies: Policy[]; resources: Resource[] }
+interface TraceRow { policy: string; source: string; effect: Effect; matched: boolean; note: string }
+interface StepRun { state: 'pass' | 'stop' | 'skip'; result: string }
+interface Verdict { decision: 'ALLOW' | 'DENY'; reason: string; explicit: boolean; trace: TraceRow[]; steps: StepRun[] }
+
+const REGION = 'eu-west-3'
+const ACCOUNT = '123456789012'
+
+const SERVICES: Record<ServiceType, { label: string; actions: string[]; arn: (n: string) => string }> = {
+  s3: { label: 'S3 bucket', actions: ['s3:GetObject', 's3:PutObject', 's3:DeleteObject', 's3:ListBucket'], arn: (n) => `arn:aws:s3:::${n}` },
+  dynamodb: { label: 'DynamoDB table', actions: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:DeleteItem', 'dynamodb:Query'], arn: (n) => `arn:aws:dynamodb:${REGION}:${ACCOUNT}:table/${n}` },
+  lambda: { label: 'Lambda function', actions: ['lambda:InvokeFunction', 'lambda:GetFunction', 'lambda:DeleteFunction'], arn: (n) => `arn:aws:lambda:${REGION}:${ACCOUNT}:function:${n}` },
+  ec2: { label: 'EC2 instance', actions: ['ec2:DescribeInstances', 'ec2:StartInstances', 'ec2:StopInstances', 'ec2:TerminateInstances'], arn: (n) => `arn:aws:ec2:${REGION}:${ACCOUNT}:instance/${n}` },
+}
+const TRUST = ['lambda.amazonaws.com', 'ec2.amazonaws.com', 's3.amazonaws.com']
+const PASSWORD_RULES = [
+  { label: '8 characters or more', test: (p: string) => p.length >= 8 },
+  { label: 'Upper and lower case', test: (p: string) => /[a-z]/.test(p) && /[A-Z]/.test(p) },
+  { label: 'A number', test: (p: string) => /\d/.test(p) },
+  { label: 'A symbol', test: (p: string) => /[^a-zA-Z0-9]/.test(p) },
+]
+
+const WORKFLOW = [
+  { title: 'Authenticate', info: 'IAM checks who is calling. A user signs in with a password, and with MFA if it is on. A role is assumed by a service that trusts it.' },
+  { title: 'Build the request', info: 'The action and the resource ARN become the request IAM has to judge.' },
+  { title: 'Collect the policies', info: 'IAM gathers every policy attached to the user, to its groups, or to the role.' },
+  { title: 'Look for an explicit Deny', info: 'A matching Deny ends the check at once. It beats any Allow.' },
+  { title: 'Look for an Allow', info: 'With no Deny, IAM needs one matching Allow whose conditions are met.' },
+  { title: 'Decide', info: 'Access is allowed only if an Allow matched. Everything else is denied by default.' },
+]
+const STEP_MS = 520
+
+const INITIAL: Sim = {
+  users: [{ name: 'sara.dev', mfa: false, mustReset: false, policies: [] }],
+  groups: [{ name: 'Developers', members: ['sara.dev'], policies: [] }, { name: 'Finance', members: [], policies: [] }],
+  roles: [{ name: 'OrderFunctionRole', trust: 'lambda.amazonaws.com', policies: [] }],
+  policies: [
+    { name: 'ReadOrdersBucket', effect: 'Allow', actions: ['s3:GetObject'], resources: ['arn:aws:s3:::student-demo-bucket/*'], needsMfa: false },
+    { name: 'DenyS3Delete', effect: 'Deny', actions: ['s3:Delete*'], resources: ['*'], needsMfa: false },
+    { name: 'ManageOrdersTable', effect: 'Allow', actions: ['dynamodb:*'], resources: [SERVICES.dynamodb.arn('orders')], needsMfa: true },
+  ],
+  resources: [{ type: 's3', name: 'student-demo-bucket' }, { type: 'dynamodb', name: 'orders' }, { type: 'lambda', name: 'process-orders' }],
 }
 
-const INITIAL_STATE: SimState = {
-  users: ['sara.dev'],
-  mfaUsers: [],
-  groups: { Developers: ['sara.dev'], Finance: [] },
-  policies: {
-    ReadOrdersBucket: {
-      effect: 'Allow',
-      action: 's3:GetObject',
-      resource: 'arn:aws:s3:::student-demo-bucket/*',
-    },
-    DenyAllS3: {
-      effect: 'Deny',
-      action: 's3:*',
-      resource: '*',
-    },
-  },
-  attachedGroupPolicies: { Developers: [], Finance: [] },
-  roles: {
-    OrderFunctionRole: { trust: 'lambda.amazonaws.com', policy: null },
-  },
-}
+const NAV: { id: View; label: string; Icon: typeof Users }[] = [
+  { id: 'users', label: 'Users', Icon: UserRound },
+  { id: 'groups', label: 'Groups', Icon: Users },
+  { id: 'roles', label: 'Roles', Icon: KeyRound },
+  { id: 'policies', label: 'Policies', Icon: ScrollText },
+  { id: 'services', label: 'Services', Icon: Box },
+  { id: 'test', label: 'Request tester', Icon: FlaskConical },
+]
 
-const MISSIONS = [
-  {
-    id: 1,
-    title: 'Create a user & MFA',
-    goal: 'Create one more user and turn on MFA for someone.',
-    hint: 'Type a name such as "karim.dev", click Create, then flip the MFA switch on.',
-    check: (s: SimState) => s.users.length >= 2 && s.mfaUsers.length >= 1,
-  },
+const CHALLENGES: { id: number; title: string; view: View; check: (s: Sim, denied: boolean) => boolean }[] = [
+  { id: 1, title: 'Create a user and turn on MFA', view: 'users', check: (s) => s.users.length >= 2 && s.users.some((u) => u.mfa) },
   {
     id: 2,
-    title: 'Group & policy',
-    goal: 'Put a user in a group and attach ReadOrdersBucket to it.',
-    hint: 'Pick a group and a user, click Add, then attach ReadOrdersBucket.',
-    check: (s: SimState) =>
-      Object.entries(s.attachedGroupPolicies).some(
-        ([group, policies]) => policies.includes('ReadOrdersBucket') && (s.groups[group]?.length ?? 0) > 0,
-      ),
+    title: 'Let a group read a bucket',
+    view: 'groups',
+    check: (s) => s.groups.some((g) => g.members.length > 0 && g.policies.some((n) => s.policies.find((p) => p.name === n)?.effect === 'Allow')),
   },
-  {
-    id: 3,
-    title: 'Lambda role',
-    goal: 'Attach ReadOrdersBucket to OrderFunctionRole.',
-    hint: 'In the role card, choose ReadOrdersBucket in the select.',
-    check: (s: SimState) => s.roles.OrderFunctionRole?.policy === 'ReadOrdersBucket',
-  },
+  { id: 3, title: 'Get blocked by an explicit Deny', view: 'test', check: (_s, denied) => denied },
 ]
 
-const RESOURCES = [
-  { title: 'S3 bucket', detail: 'student-demo-bucket', y: 16 },
-  { title: 'DynamoDB table', detail: 'orders', y: 92 },
-  { title: 'Billing', detail: 'cost reports', y: 168 },
+const ROW_H = 64
+const ROW_GAP = 14
+const SCENARIOS = [
+  { title: 'Sara reads orders', who: 'user:sara.dev', res: 's3:student-demo-bucket', action: 's3:GetObject' },
+  { title: 'Lambda queries table', who: 'role:OrderFunctionRole', res: 'dynamodb:orders', action: 'dynamodb:Query' },
+  { title: 'Sara deletes a file', who: 'user:sara.dev', res: 's3:student-demo-bucket', action: 's3:DeleteObject' },
+  { title: 'Sara opens the table', who: 'user:sara.dev', res: 'dynamodb:orders', action: 'dynamodb:GetItem' },
 ]
 
-function initials(name: string) {
-  const clean = name.replace(/[^a-zA-Z0-9]/g, '')
-  return (clean.slice(0, 2) || '?').toUpperCase()
+const split = (v: string) => v.split(/[\n,]/).map((x) => x.trim()).filter(Boolean)
+const initials = (n: string) => (n.replace(/[^a-zA-Z0-9]/g, '').slice(0, 2) || '?').toUpperCase()
+const arnOf = (r: Resource) => SERVICES[r.type].arn(r.name)
+const keyOf = (r: Resource) => `${r.type}:${r.name}`
+const glob = (pattern: string, value: string, ci: boolean) =>
+  new RegExp('^' + pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$', ci ? 'i' : '').test(value)
+const requestArn = (r: Resource, action: string) => (r.type === 's3' && action.endsWith('Object') ? `${arnOf(r)}/example.txt` : arnOf(r))
+
+function evaluate(sim: Sim, principal: string, action: string, arn: string, mfa: boolean): Verdict {
+  const sources: { name: string; source: string }[] = []
+  const id = principal.slice(5)
+  if (principal.startsWith('user:')) {
+    sim.users.find((u) => u.name === id)?.policies.forEach((name) => sources.push({ name, source: 'the user' }))
+    sim.groups.filter((g) => g.members.includes(id)).forEach((g) => g.policies.forEach((name) => sources.push({ name, source: `group ${g.name}` })))
+  } else {
+    sim.roles.find((r) => r.name === id)?.policies.forEach((name) => sources.push({ name, source: 'the role' }))
+  }
+  const trace: TraceRow[] = []
+  for (const { name, source } of sources) {
+    const p = sim.policies.find((x) => x.name === name)
+    if (!p) continue
+    const hit = p.actions.some((a) => glob(a, action, true)) && p.resources.some((r) => glob(r, arn, false))
+    const noMfa = hit && p.needsMfa && !mfa
+    trace.push({
+      policy: name,
+      source,
+      effect: p.effect,
+      matched: hit && !noMfa,
+      note: !hit ? 'Action or resource does not match' : noMfa ? 'Condition not met: no MFA on this sign-in' : 'Matches',
+    })
+  }
+  const hits = trace.filter((t) => t.matched)
+  const deny = hits.find((t) => t.effect === 'Deny')
+  const allow = hits.find((t) => t.effect === 'Allow')
+  const decision = deny || !allow ? 'DENY' : 'ALLOW'
+  const reason = deny
+    ? 'An explicit Deny matched, and a Deny always wins over an Allow.'
+    : allow
+      ? 'An Allow matched and nothing denies it.'
+      : trace.some((t) => t.effect === 'Allow' && t.note.startsWith('Condition'))
+        ? 'Implicit deny: an Allow exists, but it only applies when the user signed in with MFA.'
+        : trace.length
+          ? 'Implicit deny: policies are attached, but none allows this action on this resource.'
+          : 'Implicit deny: this identity has no policy at all.'
+  const role = sim.roles.find((r) => r.name === id)
+  const steps: StepRun[] = [
+    { state: 'pass', result: principal.startsWith('user:') ? `${id} signed in ${mfa ? 'with' : 'without'} MFA` : `${id} assumed by ${role?.trust ?? 'a trusted service'}` },
+    { state: 'pass', result: `${action} on ${arn}` },
+    { state: 'pass', result: sources.length ? `${sources.length} attached: ${sources.map((x) => `${x.name} (${x.source})`).join(', ')}` : 'No policy attached' },
+    deny ? { state: 'stop', result: `Matched Deny in ${deny.policy}` } : { state: 'pass', result: 'No Deny matched' },
+    deny
+      ? { state: 'skip', result: 'Skipped, the Deny already decided' }
+      : allow
+        ? { state: 'pass', result: `Matched Allow in ${allow.policy}` }
+        : { state: 'stop', result: trace.some((t) => t.effect === 'Allow' && t.note.startsWith('Condition')) ? 'An Allow exists, but its MFA condition was not met' : 'No Allow matched' },
+    { state: decision === 'ALLOW' ? 'pass' : 'stop', result: `${decision}. ${reason}` },
+  ]
+  return { decision, explicit: !!deny, reason, trace, steps }
+}
+
+function Chips({ items, onRemove, empty, kind = 'chip' }: { items: string[]; onRemove: (v: string) => void; empty: string; kind?: 'chip' | 'policy' }) {
+  return (
+    <div className="lab-chips">
+      {items.length ? items.map((i) => (
+        <span key={i} className={`lab-${kind}`}>
+          {i}
+          <button type="button" aria-label={`Remove ${i}`} onClick={() => onRemove(i)}><X size={11} /></button>
+        </span>
+      )) : <span className="lab-empty">{empty}</span>}
+    </div>
+  )
+}
+
+function AddSelect({ label, options, onPick }: { label: string; options: string[]; onPick: (v: string) => void }) {
+  if (!options.length) return null
+  return (
+    <select className="lab-add" value="" aria-label={label} onChange={(e) => e.target.value && onPick(e.target.value)}>
+      <option value="">{label}</option>
+      {options.map((o) => <option key={o} value={o}>{o}</option>)}
+    </select>
+  )
+}
+
+function Attach({ all, value, onChange }: { all: string[]; value: string[]; onChange: (next: string[]) => void }) {
+  return (
+    <>
+      <Chips kind="policy" items={value} empty="No policy attached" onRemove={(p) => onChange(value.filter((x) => x !== p))} />
+      <AddSelect label="+ Attach policy" options={all.filter((p) => !value.includes(p))} onPick={(p) => onChange([...value, p])} />
+    </>
+  )
 }
 
 export default function IamLab() {
   const navigate = useNavigate()
-  const [searchParams, setSearchParams] = useSearchParams()
-  const mode: Mode = searchParams.get('mode') === 'sandbox' ? 'sandbox' : 'missions'
-  const [state, setState] = useState<SimState>(INITIAL_STATE)
-  const [newUser, setNewUser] = useState('')
-  const [selectedGroup, setSelectedGroup] = useState('Developers')
-  const [selectedMember, setSelectedMember] = useState('sara.dev')
-  const [selectedPolicy, setSelectedPolicy] = useState('ReadOrdersBucket')
-  const [simPrincipal, setSimPrincipal] = useState('user:sara.dev')
-  const [simAction, setSimAction] = useState('s3:GetObject')
-  const [simResource, setSimResource] = useState('arn:aws:s3:::student-demo-bucket/notes.pdf')
-  const [showHint, setShowHint] = useState<Record<number, boolean>>({})
-  const [flowPhase, setFlowPhase] = useState<FlowPhase>('idle')
-  const [tested, setTested] = useState<Verdict | null>(null)
-  const [celebrate, setCelebrate] = useState(false)
+  const [sim, setSim] = useState<Sim>(INITIAL)
+  const [view, setView] = useState<View>('users')
+  const [error, setError] = useState('')
   const [toast, setToast] = useState<string | null>(null)
-  const flowTimers = useRef<number[]>([])
+  const [uName, setUName] = useState('')
+  const [uPass, setUPass] = useState('')
+  const [uReset, setUReset] = useState(true)
+  const [gName, setGName] = useState('')
+  const [rName, setRName] = useState('')
+  const [rTrust, setRTrust] = useState(TRUST[0])
+  const [pf, setPf] = useState({ name: '', effect: 'Allow' as Effect, actions: '', resources: '', needsMfa: false })
+  const [sType, setSType] = useState<ServiceType>('s3')
+  const [sName, setSName] = useState('')
+  const [principal, setPrincipal] = useState('user:sara.dev')
+  const [simRes, setSimRes] = useState('')
+  const [simAction, setSimAction] = useState('')
+  const [revealed, setRevealed] = useState(0)
+  const [run, setRun] = useState<Verdict | null>(null)
+  const [denied, setDenied] = useState(false)
+  const [autoRun, setAutoRun] = useState(0)
+  const timers = useRef<number[]>([])
   const toastTimer = useRef(0)
-  const celebrateTimer = useRef(0)
-  const previousCompleted = useRef<number[]>([])
-  const simRef = useRef<HTMLElement>(null)
-  const [confetti] = useState(() =>
-    Array.from({ length: 26 }, (_, index) => ({
-      left: Math.random() * 100,
-      delay: Math.random() * 0.5,
-      duration: 1.6 + Math.random() * 1.1,
-      color: ['#ffb020', '#38bdf8', '#34d399', '#f472b6', '#facc15'][index % 5],
-      rotate: Math.random() * 360,
-    })),
-  )
+  const done = useRef<number[]>([])
+
+  const policyNames = sim.policies.map((p) => p.name)
+  const completed = CHALLENGES.filter((c) => c.check(sim, denied)).map((c) => c.id)
+  const completedKey = completed.join(',')
+  const identities = [...sim.users.map((u) => `user:${u.name}`), ...sim.roles.map((r) => `role:${r.name}`)]
+  const who = identities.includes(principal) ? principal : identities[0]
+  const target = sim.resources.find((r) => keyOf(r) === simRes) ?? sim.resources[0]
+  const actions = target ? SERVICES[target.type].actions : []
+  const act = actions.includes(simAction) ? simAction : actions[0]
+  const phase: FlowPhase = revealed === 0 ? 'idle' : revealed < 3 ? 'identity' : revealed < WORKFLOW.length ? 'iam' : 'result'
+  const running = revealed > 0 && revealed < WORKFLOW.length
+  const verdict = run && revealed >= WORKFLOW.length ? run : null
+  const whoName = who ? who.slice(5) : ''
+  const mfaOn = !!who?.startsWith('user:') && !!sim.users.find((u) => u.name === whoName)?.mfa
 
   useEffect(() => {
-    window.scrollTo(0, 0)
-  }, [])
-
-  const completedMissions = MISSIONS.filter((mission) => mission.check(state))
-  const completedIds = completedMissions.map((mission) => mission.id)
-  const completedKey = completedIds.join(',')
-  const allDone = completedMissions.length === MISSIONS.length
-  const activeMission = MISSIONS.find((mission) => !completedIds.includes(mission.id)) ?? null
-
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return
-      navigate('/')
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !(e.target as HTMLElement).closest('input,select,textarea')) navigate('/')
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
@@ -129,537 +228,506 @@ export default function IamLab() {
 
   useEffect(() => {
     const ids = completedKey ? completedKey.split(',').map(Number) : []
-    const newly = ids.filter((id) => !previousCompleted.current.includes(id))
-    previousCompleted.current = ids
-    if (newly.length === 0) return
-
-    window.clearTimeout(toastTimer.current)
-    setToast(`Mission ${newly[0]} complete!`)
-    toastTimer.current = window.setTimeout(() => setToast(null), 2200)
-
-    if (ids.length === MISSIONS.length) {
-      setCelebrate(true)
-      window.clearTimeout(celebrateTimer.current)
-      celebrateTimer.current = window.setTimeout(() => setCelebrate(false), 2600)
-    }
+    const fresh = ids.filter((id) => !done.current.includes(id))
+    done.current = ids
+    if (fresh.length) notify(`Challenge ${fresh[0]} done`)
   }, [completedKey])
 
+  useEffect(() => {
+    if (autoRun > 0) runTest()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoRun])
+
   useEffect(() => () => {
-    flowTimers.current.forEach((timer) => window.clearTimeout(timer))
+    timers.current.forEach((t) => window.clearTimeout(t))
     window.clearTimeout(toastTimer.current)
-    window.clearTimeout(celebrateTimer.current)
   }, [])
 
-  function resetFlow() {
-    flowTimers.current.forEach((timer) => window.clearTimeout(timer))
-    flowTimers.current = []
-    setFlowPhase('idle')
-    setTested(null)
+  function notify(message: string) {
+    window.clearTimeout(toastTimer.current)
+    setToast(message)
+    toastTimer.current = window.setTimeout(() => setToast(null), 2600)
   }
+
+  function resetFlow() {
+    timers.current.forEach((t) => window.clearTimeout(t))
+    timers.current = []
+    setRevealed(0)
+    setRun(null)
+  }
+
+  function mutate(fn: (s: Sim) => Sim) {
+    setSim(fn)
+    setError('')
+    resetFlow()
+  }
+
+  function go(next: View) {
+    setView(next)
+    setError('')
+  }
+
+  const fail = (message: string) => setError(message)
 
   function createUser() {
-    const clean = newUser.trim().toLowerCase().replace(/[^a-z0-9._-]/g, '')
-    if (!clean || state.users.includes(clean)) return
-    setState((prev) => ({
-      ...prev,
-      users: [...prev.users, clean],
-      groups: {
-        ...prev.groups,
-        [selectedGroup]: [...(prev.groups[selectedGroup] ?? []), clean],
-      },
-    }))
-    setSelectedMember(clean)
-    setNewUser('')
+    const name = uName.trim().toLowerCase()
+    if (!/^[a-z0-9._-]{2,40}$/.test(name)) return fail('User names use 2 to 40 letters, digits, dots, dashes or underscores.')
+    if (sim.users.some((u) => u.name === name)) return fail(`The user ${name} already exists.`)
+    if (!PASSWORD_RULES.every((r) => r.test(uPass))) return fail('The password does not meet the policy yet.')
+    mutate((s) => ({ ...s, users: [...s.users, { name, mfa: false, mustReset: uReset, policies: [] }] }))
+    setUName('')
+    setUPass('')
+    notify(`User ${name} created. The password was not stored.`)
   }
 
-  function toggleMfa(user: string) {
-    setState((prev) => ({
-      ...prev,
-      mfaUsers: prev.mfaUsers.includes(user)
-        ? prev.mfaUsers.filter((item) => item !== user)
-        : [...prev.mfaUsers, user],
-    }))
-  }
+  const patchUser = (name: string, patch: Partial<User>) =>
+    mutate((s) => ({ ...s, users: s.users.map((u) => (u.name === name ? { ...u, ...patch } : u)) }))
+  const deleteUser = (name: string) =>
+    mutate((s) => ({ ...s, users: s.users.filter((u) => u.name !== name), groups: s.groups.map((g) => ({ ...g, members: g.members.filter((m) => m !== name) })) }))
 
-  function addUserToGroup() {
-    if (!selectedMember) return
-    setState((prev) => {
-      const current = prev.groups[selectedGroup] ?? []
-      if (current.includes(selectedMember)) return prev
+  function createGroup() {
+    const name = gName.trim()
+    if (!/^[\w+=,.@-]{1,64}$/.test(name)) return fail('Group names use letters, digits and + = , . @ _ - (max 64).')
+    if (sim.groups.some((g) => g.name === name)) return fail(`The group ${name} already exists.`)
+    mutate((s) => ({ ...s, groups: [...s.groups, { name, members: [], policies: [] }] }))
+    setGName('')
+  }
+  const patchGroup = (name: string, patch: Partial<Group>) =>
+    mutate((s) => ({ ...s, groups: s.groups.map((g) => (g.name === name ? { ...g, ...patch } : g)) }))
+
+  function createRole() {
+    const name = rName.trim()
+    if (!/^[\w+=,.@-]{1,64}$/.test(name)) return fail('Role names use letters, digits and + = , . @ _ - (max 64).')
+    if (sim.roles.some((r) => r.name === name)) return fail(`The role ${name} already exists.`)
+    mutate((s) => ({ ...s, roles: [...s.roles, { name, trust: rTrust, policies: [] }] }))
+    setRName('')
+  }
+  const patchRole = (name: string, patch: Partial<Role>) =>
+    mutate((s) => ({ ...s, roles: s.roles.map((r) => (r.name === name ? { ...r, ...patch } : r)) }))
+
+  function savePolicy() {
+    const name = pf.name.trim()
+    const acts = split(pf.actions)
+    const res = split(pf.resources)
+    if (!/^[\w+=,.@-]{1,64}$/.test(name)) return fail('Policy names use letters, digits and + = , . @ _ - (max 64).')
+    if (!acts.length || !acts.every((a) => /^(\*|[a-z0-9-]+:[A-Za-z0-9*?]+)$/.test(a))) return fail('Actions look like s3:GetObject, s3:Delete* or *.')
+    if (!res.length || !res.every((r) => r === '*' || r.startsWith('arn:'))) return fail('Resources are * or ARNs that start with arn:.')
+    const policy: Policy = { name, effect: pf.effect, actions: acts, resources: res, needsMfa: pf.needsMfa }
+    const exists = sim.policies.some((p) => p.name === name)
+    mutate((s) => ({ ...s, policies: exists ? s.policies.map((p) => (p.name === name ? policy : p)) : [...s.policies, policy] }))
+    setPf({ name: '', effect: 'Allow', actions: '', resources: '', needsMfa: false })
+    notify(exists ? `Policy ${name} updated` : `Policy ${name} created`)
+  }
+  const addTo = (key: 'actions' | 'resources', v: string) =>
+    setPf((f) => ({ ...f, [key]: split(f[key]).includes(v) ? f[key] : [...split(f[key]), v].join(', ') }))
+  const deletePolicy = (name: string) =>
+    mutate((s) => {
+      const strip = (list: string[]) => list.filter((p) => p !== name)
       return {
-        ...prev,
-        groups: { ...prev.groups, [selectedGroup]: [...current, selectedMember] },
+        ...s,
+        policies: s.policies.filter((p) => p.name !== name),
+        users: s.users.map((u) => ({ ...u, policies: strip(u.policies) })),
+        groups: s.groups.map((g) => ({ ...g, policies: strip(g.policies) })),
+        roles: s.roles.map((r) => ({ ...r, policies: strip(r.policies) })),
       }
     })
-  }
 
-  function attachPolicyToGroup() {
-    setState((prev) => {
-      const current = prev.attachedGroupPolicies[selectedGroup] ?? []
-      if (current.includes(selectedPolicy)) return prev
-      return {
-        ...prev,
-        attachedGroupPolicies: {
-          ...prev.attachedGroupPolicies,
-          [selectedGroup]: [...current, selectedPolicy],
-        },
-      }
-    })
-  }
-
-  function attachPolicyToRole(roleName: string, policyName: string) {
-    setState((prev) => ({
-      ...prev,
-      roles: {
-        ...prev.roles,
-        [roleName]: { ...prev.roles[roleName], policy: policyName || null },
-      },
-    }))
-  }
-
-  function evaluateAccess(): Verdict {
-    const matchingPolicies: Array<{ name: string; effect: 'Allow' | 'Deny' }> = []
-
-    if (simPrincipal.startsWith('user:')) {
-      const user = simPrincipal.replace('user:', '')
-      for (const [group, members] of Object.entries(state.groups)) {
-        if (members.includes(user)) {
-          for (const policyName of state.attachedGroupPolicies[group] ?? []) {
-            const policy = state.policies[policyName]
-            if (policy) matchingPolicies.push({ name: policyName, effect: policy.effect })
-          }
-        }
-      }
-    } else if (simPrincipal.startsWith('role:')) {
-      const role = state.roles[simPrincipal.replace('role:', '')]
-      if (role?.policy && state.policies[role.policy]) {
-        matchingPolicies.push({ name: role.policy, effect: state.policies[role.policy].effect })
-      }
-    }
-
-    const matchesActionAndResource = (policyName: string) => {
-      const policy = state.policies[policyName]
-      if (!policy) return false
-      const actionOk = policy.action === '*' || policy.action === simAction || (policy.action.endsWith(':*') && simAction.startsWith(policy.action.slice(0, -1)))
-      const resourceOk = policy.resource === '*' || policy.resource === simResource || (policy.resource.endsWith('/*') && simResource.startsWith(policy.resource.slice(0, -1)))
-      return actionOk && resourceOk
-    }
-
-    const applicable = matchingPolicies.filter((policy) => matchesActionAndResource(policy.name))
-    if (applicable.some((policy) => policy.effect === 'Deny')) {
-      return { decision: 'DENY', reason: 'An explicit Deny matched this request and wins over every Allow.' }
-    }
-    if (applicable.some((policy) => policy.effect === 'Allow')) {
-      return { decision: 'ALLOW', reason: 'A matching Allow policy was found, with no Deny to block it.' }
-    }
-    return { decision: 'DENY', reason: 'Implicit default deny: no attached policy allows this action on this resource.' }
+  function createResource() {
+    const name = sName.trim().toLowerCase()
+    if (!/^[a-z0-9-]{3,40}$/.test(name)) return fail('Service names use 3 to 40 lowercase letters, digits or dashes.')
+    if (sim.resources.some((r) => r.type === sType && r.name === name)) return fail('That service already exists.')
+    mutate((s) => ({ ...s, resources: [...s.resources, { type: sType, name }] }))
+    setSName('')
   }
 
   function runTest() {
+    if (!who || !target || !act) return
     resetFlow()
-    setFlowPhase('identity')
-    const result = evaluateAccess()
-    flowTimers.current.push(window.setTimeout(() => setFlowPhase('iam'), 550))
-    flowTimers.current.push(window.setTimeout(() => {
-      setTested(result)
-      setFlowPhase('result')
-    }, 1200))
+    const mfa = who.startsWith('user:') && !!sim.users.find((u) => u.name === whoName)?.mfa
+    const result = evaluate(sim, who, act, requestArn(target, act), mfa)
+    setRun(result)
+    setRevealed(1)
+    for (let i = 2; i <= WORKFLOW.length; i++) {
+      timers.current.push(window.setTimeout(() => {
+        setRevealed(i)
+        if (i === WORKFLOW.length && result.explicit) setDenied(true)
+      }, (i - 1) * STEP_MS))
+    }
   }
 
-  function startTest() {
-    simRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-    flowTimers.current.push(window.setTimeout(runTest, 420))
+  function playScenario(sc: (typeof SCENARIOS)[number]) {
+    setPrincipal(sc.who)
+    setSimRes(sc.res)
+    setSimAction(sc.action)
+    setAutoRun((n) => n + 1)
   }
 
   function resetAll() {
     resetFlow()
-    window.clearTimeout(toastTimer.current)
-    window.clearTimeout(celebrateTimer.current)
-    setState(INITIAL_STATE)
-    setNewUser('')
-    setSelectedGroup('Developers')
-    setSelectedMember('sara.dev')
-    setSelectedPolicy('ReadOrdersBucket')
-    setSimPrincipal('user:sara.dev')
-    setSimAction('s3:GetObject')
-    setSimResource('arn:aws:s3:::student-demo-bucket/notes.pdf')
-    setShowHint({})
-    setToast(null)
-    setCelebrate(false)
-    previousCompleted.current = []
+    setSim(INITIAL)
+    setView('users')
+    setError('')
+    setUName(''); setUPass(''); setGName(''); setRName(''); setSName('')
+    setPf({ name: '', effect: 'Allow', actions: '', resources: '', needsMfa: false })
+    setPrincipal('user:sara.dev')
+    setDenied(false)
+    done.current = []
   }
 
-  function switchMode(next: Mode) {
-    resetFlow()
-    setSearchParams({ mode: next })
-  }
-
-  const doneCount = completedMissions.length
-  const simName = simPrincipal.slice(5)
-  const simLabel = simName.length > 16 ? `${simName.slice(0, 15)}…` : simName
-  const targetIndex = simAction.startsWith('s3:') || simResource.includes('s3')
-    ? 0
-    : simAction.startsWith('dynamodb:') || simResource.includes('dynamodb')
-      ? 1
-      : 2
-  const packetTransform = flowPhase === 'iam'
-    ? 'translate(305px, 120px)'
-    : flowPhase === 'result'
-      ? `translate(440px, ${RESOURCES[targetIndex].y + 28}px)`
-      : 'translate(110px, 120px)'
-  const running = flowPhase === 'identity' || flowPhase === 'iam'
-  const flowStatus = flowPhase === 'identity'
-    ? 'Request received'
-    : flowPhase === 'iam'
-      ? 'Checking policy'
-      : flowPhase === 'result'
-        ? tested?.decision === 'ALLOW' ? 'Allowed' : 'Denied'
-        : 'Ready'
-  const verdict = tested
+  const counts: Partial<Record<View, number>> = { users: sim.users.length, groups: sim.groups.length, roles: sim.roles.length, policies: sim.policies.length, services: sim.resources.length }
+  const verdictClass = verdict ? (verdict.decision === 'ALLOW' ? 'ok' : 'no') : ''
+  const rows = sim.resources.length
+  const fanH = rows * ROW_H + Math.max(0, rows - 1) * ROW_GAP
+  const rowY = (i: number) => i * (ROW_H + ROW_GAP) + ROW_H / 2
+  const targetIdx = target ? Math.max(0, sim.resources.indexOf(target)) : 0
+  const scenarios = SCENARIOS.filter((sc) => identities.includes(sc.who) && sim.resources.some((r) => keyOf(r) === sc.res))
+  const caption = !who
+    ? ''
+    : phase === 'idle'
+      ? 'Pick who asks, the service and the action, or play an example above. Then follow the request through IAM.'
+      : phase === 'result' && verdict
+        ? `${verdict.decision}. ${verdict.reason}`
+        : who.startsWith('user:')
+          ? `${whoName} signed in ${mfaOn ? 'with' : 'without'} MFA, so IAM loads the policies attached to the user and to their groups.`
+          : `${whoName} has no password. A service that trusts it assumed the role, so IAM loads the policies attached to that role.`
+  const groupsOf = (name: string) => sim.groups.filter((g) => g.members.includes(name)).map((g) => g.name)
+  const quickResources = sim.resources.flatMap((r) => (r.type === 's3' ? [arnOf(r), `${arnOf(r)}/*`] : [arnOf(r)]))
 
   return (
     <main className="lab-page" aria-label="IAM Lab simulation">
-      <div className="lab-shell">
-        <header className="lab-head">
-          <div className="lab-brand">
-            <span className="lab-logo" aria-hidden="true">&gt;_</span>
-            <div>
-              <p className="lab-eyebrow">Safe practice account</p>
-              <h2 className="lab-title">IAM Lab</h2>
-            </div>
+      <header className="lab-topbar">
+        <div className="lab-brand">
+          <span className="lab-logo" aria-hidden="true">&gt;_&lt;</span>
+          <div>
+            <h2 className="lab-title">IAM Lab</h2>
+            <p className="lab-eyebrow">Practice account. Everything stays in your browser.</p>
           </div>
-          <div className="lab-switch" role="group" aria-label="Lab mode">
-            <button type="button" className={mode === 'missions' ? 'on' : ''} onClick={() => switchMode('missions')}>
-              Guided missions
-            </button>
-            <button type="button" className={mode === 'sandbox' ? 'on' : ''} onClick={() => switchMode('sandbox')}>
-              Free sandbox
-            </button>
-          </div>
-          <div className="lab-actions">
-            <button type="button" className="lab-icon-btn" onClick={resetAll} title="Reset simulation" aria-label="Reset simulation">
-              <RotateCcw size={15} />
-            </button>
-            <button type="button" className="lab-icon-btn" onClick={() => navigate('/')} title="Back to site" aria-label="Back to site">
-              <ArrowLeft size={17} />
-            </button>
-          </div>
-        </header>
+        </div>
+        <div className="lab-actions">
+          <button type="button" className="lab-icon-btn" onClick={resetAll} title="Reset the lab" aria-label="Reset the lab"><RotateCcw size={15} /></button>
+          <button type="button" className="lab-icon-btn" onClick={() => navigate('/')} title="Back to site" aria-label="Back to site"><ArrowLeft size={17} /></button>
+        </div>
+      </header>
 
-        {mode === 'missions' ? (
-          <>
-            <div className="lab-progress">
-              <div className="lab-progress-text">
-                <span>Mission progress</span>
-                <b>{doneCount} / {MISSIONS.length}</b>
-              </div>
-              <div className="lab-progress-track"><i style={{ width: `${(doneCount / MISSIONS.length) * 100}%` }} /></div>
-            </div>
-
-            <div className="lab-missions">
-              {MISSIONS.map((mission) => {
-                const done = completedIds.includes(mission.id)
-                const active = activeMission?.id === mission.id
+      <div className="lab-body">
+        <aside className="lab-side">
+          <nav className="lab-nav" aria-label="IAM console">
+            {NAV.map(({ id, label, Icon }) => (
+              <button key={id} type="button" className={view === id ? 'on' : ''} aria-current={view === id ? 'page' : undefined} onClick={() => go(id)}>
+                <Icon size={16} aria-hidden="true" /> {label}
+                {counts[id] !== undefined && <span className="lab-count">{counts[id]}</span>}
+              </button>
+            ))}
+          </nav>
+          <div className="lab-side-missions">
+            <div className="lab-progress-text"><span>Challenges</span><b>{completed.length} / {CHALLENGES.length}</b></div>
+            <div className="lab-progress-track"><i style={{ width: `${(completed.length / CHALLENGES.length) * 100}%` }} /></div>
+            <ul>
+              {CHALLENGES.map((c) => {
+                const ok = completed.includes(c.id)
                 return (
-                  <article key={mission.id} className={`lab-mission${done ? ' done' : ''}${active ? ' active' : ''}`}>
-                    <span className="lab-mission-num" aria-hidden="true">
-                      {done ? <CheckCircle2 size={17} /> : mission.id}
-                    </span>
-                    <div className="lab-mission-copy">
-                      <div className="lab-mission-head">
-                        <strong>{mission.title}</strong>
-                        <span className="lab-mission-state">{done ? 'Done' : active ? 'Active' : 'Next'}</span>
-                      </div>
-                      <p>{mission.goal}</p>
-                      {showHint[mission.id] && <p className="lab-hint-text">{mission.hint}</p>}
-                    </div>
-                    <button
-                      type="button"
-                      className="lab-hint-btn"
-                      onClick={() => setShowHint((current) => ({ ...current, [mission.id]: !current[mission.id] }))}
-                    >
-                      <Lightbulb size={13} /> Hint
+                  <li key={c.id}>
+                    <button type="button" className={`lab-mission${ok ? ' done' : ''}`} onClick={() => go(c.view)}>
+                      <span className="lab-mission-num" aria-hidden="true">{ok ? <CheckCircle2 size={16} /> : c.id}</span>
+                      <span>{c.title}</span>
                     </button>
-                  </article>
-                )
-              })}
-            </div>
-
-            {allDone && (
-              <div className="lab-complete">
-                <span className="lab-complete-icon" aria-hidden="true"><Sparkles size={18} /></span>
-                <div>
-                  <strong>Lab complete!</strong>
-                  <p>You built a user, used a group policy, and trusted a role with a policy.</p>
-                </div>
-                <button type="button" className="btn lab-btn" onClick={startTest}>
-                  <Play size={13} aria-hidden="true" /> Test a request
-                </button>
-              </div>
-            )}
-          </>
-        ) : (
-          <p className="lab-sandbox-note">
-            <Sparkles size={14} aria-hidden="true" /> Everything is unlocked. Create users, groups and roles, then test any request below.
-          </p>
-        )}
-
-        <div className="lab-grid">
-          <section className="lab-box">
-            <div className="lab-box-head">
-              <span className="lab-box-num">01</span>
-              <div>
-                <p className="lab-box-kicker">Identity</p>
-                <h3>Users &amp; MFA</h3>
-              </div>
-            </div>
-            <div className="lab-row">
-              <input
-                type="text"
-                value={newUser}
-                onChange={(event) => setNewUser(event.target.value)}
-                onKeyDown={(event) => { if (event.key === 'Enter') createUser() }}
-                placeholder="e.g. karim.dev"
-                aria-label="New IAM username"
-              />
-              <button type="button" className="btn lab-btn" onClick={createUser}>Create</button>
-            </div>
-            <ul className="lab-user-list">
-              {state.users.map((user) => {
-                const hasMfa = state.mfaUsers.includes(user)
-                return (
-                  <li key={user} className="lab-user">
-                    <span className="lab-user-avatar" aria-hidden="true">{initials(user)}</span>
-                    <span className="lab-user-name">
-                      <code>{user}</code>
-                      <small>{hasMfa ? 'MFA on' : 'MFA off'}</small>
-                    </span>
-                    <button
-                      type="button"
-                      className={`lab-mfa${hasMfa ? ' on' : ''}`}
-                      onClick={() => toggleMfa(user)}
-                      aria-pressed={hasMfa}
-                      aria-label={`Turn MFA ${hasMfa ? 'off' : 'on'} for ${user}`}
-                    />
                   </li>
                 )
               })}
             </ul>
-          </section>
+          </div>
+        </aside>
 
-          <section className="lab-box">
-            <div className="lab-box-head">
-              <span className="lab-box-num">02</span>
-              <div>
-                <p className="lab-box-kicker">Permissions</p>
-                <h3>Groups &amp; policies</h3>
-              </div>
-            </div>
-            <div className="lab-row">
-              <select value={selectedGroup} onChange={(event) => setSelectedGroup(event.target.value)} aria-label="Group">
-                {Object.keys(state.groups).map((group) => <option key={group} value={group}>{group}</option>)}
-              </select>
-              <select value={selectedMember} onChange={(event) => setSelectedMember(event.target.value)} aria-label="User to add">
-                {state.users.map((user) => <option key={user} value={user}>{user}</option>)}
-              </select>
-              <button type="button" className="btn lab-btn alt" onClick={addUserToGroup}>Add</button>
-            </div>
-            <div className="lab-row">
-              <select value={selectedPolicy} onChange={(event) => setSelectedPolicy(event.target.value)} aria-label="Policy">
-                {Object.keys(state.policies).map((policy) => <option key={policy} value={policy}>{policy}</option>)}
-              </select>
-              <button type="button" className="btn lab-btn" onClick={attachPolicyToGroup}>Attach</button>
-            </div>
-            <div className="lab-groups">
-              {Object.entries(state.groups).map(([group, members]) => (
-                <div key={group} className="lab-group">
-                  <div className="lab-group-head">
-                    <strong>{group}</strong>
-                    <span>{members.length} member{members.length === 1 ? '' : 's'}</span>
-                  </div>
-                  <div className="lab-chips">
-                    {members.length
-                      ? members.map((member) => <span key={member} className="lab-chip">{member}</span>)
-                      : <span className="lab-empty">No members yet</span>}
-                  </div>
-                  <div className="lab-policy-row">
-                    {(state.attachedGroupPolicies[group] ?? []).length
-                      ? (state.attachedGroupPolicies[group] ?? []).map((policy) => (
-                          <span key={policy} className="lab-policy"><ShieldCheck size={11} />{policy}</span>
-                        ))
-                      : <span className="lab-empty">No policy attached</span>}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </section>
+        <div className="lab-main">
+          {error && <p className="lab-error" role="alert">{error}</p>}
 
-          <section className="lab-box">
-            <div className="lab-box-head">
-              <span className="lab-box-num">03</span>
-              <div>
-                <p className="lab-box-kicker">Temporary access</p>
-                <h3>Lambda role</h3>
+          {view === 'users' && (
+            <section className="lab-panel">
+              <p className="lab-kicker">IAM / users</p>
+              <h3>Users</h3>
+              <p className="lab-panel-desc">A user is a person or an app with long-term credentials. Create one, then give it permissions through a group or a policy.</p>
+              <form className="lab-form" autoComplete="off" onSubmit={(e) => { e.preventDefault(); createUser() }}>
+                <label className="lab-field">User name
+                  <input value={uName} onChange={(e) => setUName(e.target.value)} placeholder="e.g. karim.dev" />
+                </label>
+                <label className="lab-field">Console password
+                  <input type="password" autoComplete="new-password" value={uPass} onChange={(e) => setUPass(e.target.value)} />
+                </label>
+                <ul className="lab-checks">
+                  {PASSWORD_RULES.map((r) => {
+                    const ok = r.test(uPass)
+                    return <li key={r.label} className={ok ? 'ok' : ''}>{ok ? <CheckCircle2 size={13} /> : <span className="lab-dot" />}{r.label}</li>
+                  })}
+                </ul>
+                <label className="lab-check"><input type="checkbox" checked={uReset} onChange={(e) => setUReset(e.target.checked)} /> Ask for a new password at first sign-in</label>
+                <p className="lab-note">The password is checked here, then thrown away. It is never stored or sent anywhere.</p>
+                <button type="submit" className="btn lab-btn">Create user</button>
+              </form>
+              <ul className="lab-list">
+                {sim.users.map((u) => (
+                  <li key={u.name} className="lab-item">
+                    <div className="lab-item-head">
+                      <span className="lab-user-avatar" aria-hidden="true">{initials(u.name)}</span>
+                      <div className="lab-item-title">
+                        <code>{u.name}</code>
+                        <small>{groupsOf(u.name).length ? `In ${groupsOf(u.name).join(', ')}` : 'In no group'}</small>
+                      </div>
+                      {u.mustReset && <span className="lab-tag warn">Resets password at first sign-in</span>}
+                      <span className="lab-switch-row">MFA
+                        <button type="button" className={`lab-mfa${u.mfa ? ' on' : ''}`} aria-pressed={u.mfa} aria-label={`MFA for ${u.name}`} onClick={() => patchUser(u.name, { mfa: !u.mfa })} />
+                      </span>
+                      <button type="button" className="lab-del" aria-label={`Delete ${u.name}`} onClick={() => deleteUser(u.name)}><Trash2 size={15} /></button>
+                    </div>
+                    <Attach all={policyNames} value={u.policies} onChange={(next) => patchUser(u.name, { policies: next })} />
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {view === 'groups' && (
+            <section className="lab-panel">
+              <p className="lab-kicker">IAM / groups</p>
+              <h3>Groups</h3>
+              <p className="lab-panel-desc">Attach a policy to a group once and every member gets the same permissions.</p>
+              <div className="lab-row">
+                <input value={gName} onChange={(e) => setGName(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && createGroup()} placeholder="e.g. Support" aria-label="New group name" />
+                <button type="button" className="btn lab-btn" onClick={createGroup}>Create group</button>
               </div>
-            </div>
-            {Object.entries(state.roles).map(([roleName, roleInfo]) => (
-              <div key={roleName} className="lab-role">
-                <div className="lab-role-head">
-                  <span className="lab-role-icon" aria-hidden="true"><ShieldCheck size={15} /></span>
-                  <div>
-                    <strong>{roleName}</strong>
-                    <small>Trusted by {roleInfo.trust}</small>
-                  </div>
+              <ul className="lab-list">
+                {sim.groups.map((g) => (
+                  <li key={g.name} className="lab-item">
+                    <div className="lab-item-head">
+                      <div className="lab-item-title"><strong>{g.name}</strong><small>{g.members.length} member{g.members.length === 1 ? '' : 's'}</small></div>
+                      <button type="button" className="lab-del" aria-label={`Delete ${g.name}`} onClick={() => mutate((s) => ({ ...s, groups: s.groups.filter((x) => x.name !== g.name) }))}><Trash2 size={15} /></button>
+                    </div>
+                    <Chips items={g.members} empty="No members yet" onRemove={(m) => patchGroup(g.name, { members: g.members.filter((x) => x !== m) })} />
+                    <AddSelect label="+ Add user" options={sim.users.map((u) => u.name).filter((n) => !g.members.includes(n))} onPick={(n) => patchGroup(g.name, { members: [...g.members, n] })} />
+                    <Attach all={policyNames} value={g.policies} onChange={(next) => patchGroup(g.name, { policies: next })} />
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {view === 'roles' && (
+            <section className="lab-panel">
+              <p className="lab-kicker">IAM / roles</p>
+              <h3>Roles</h3>
+              <p className="lab-panel-desc">A role gives temporary access to a service that trusts it, so no password or key sits in your code.</p>
+              <div className="lab-row">
+                <input value={rName} onChange={(e) => setRName(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && createRole()} placeholder="e.g. ReportsFunctionRole" aria-label="New role name" />
+                <select value={rTrust} onChange={(e) => setRTrust(e.target.value)} aria-label="Trusted service">{TRUST.map((t) => <option key={t}>{t}</option>)}</select>
+                <button type="button" className="btn lab-btn" onClick={createRole}>Create role</button>
+              </div>
+              <ul className="lab-list">
+                {sim.roles.map((r) => (
+                  <li key={r.name} className="lab-item">
+                    <div className="lab-item-head">
+                      <span className="lab-role-icon" aria-hidden="true"><ShieldCheck size={15} /></span>
+                      <div className="lab-item-title"><code>{r.name}</code><small>Trusted by {r.trust}</small></div>
+                      <button type="button" className="lab-del" aria-label={`Delete ${r.name}`} onClick={() => mutate((s) => ({ ...s, roles: s.roles.filter((x) => x.name !== r.name) }))}><Trash2 size={15} /></button>
+                    </div>
+                    <Attach all={policyNames} value={r.policies} onChange={(next) => patchRole(r.name, { policies: next })} />
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {view === 'policies' && (
+            <section className="lab-panel">
+              <p className="lab-kicker">IAM / policies</p>
+              <h3>Policies</h3>
+              <p className="lab-panel-desc">A policy says who may do what on which resource. Saving a name that already exists updates that policy.</p>
+              <form className="lab-form" onSubmit={(e) => { e.preventDefault(); savePolicy() }}>
+                <label className="lab-field">Policy name
+                  <input value={pf.name} onChange={(e) => setPf({ ...pf, name: e.target.value })} placeholder="e.g. ReadReports" />
+                </label>
+                <label className="lab-field">Effect
+                  <select value={pf.effect} onChange={(e) => setPf({ ...pf, effect: e.target.value as Effect })}><option>Allow</option><option>Deny</option></select>
+                </label>
+                <label className="lab-field">Actions, separated by commas
+                  <input value={pf.actions} onChange={(e) => setPf({ ...pf, actions: e.target.value })} placeholder="s3:GetObject, s3:ListBucket" />
+                </label>
+                <div className="lab-quick-row">{['s3:*', 'dynamodb:*', 'lambda:*', 'ec2:*', '*'].map((a) => <button key={a} type="button" className="lab-quick" onClick={() => addTo('actions', a)}>{a}</button>)}</div>
+                <label className="lab-field">Resources, separated by commas
+                  <input value={pf.resources} onChange={(e) => setPf({ ...pf, resources: e.target.value })} placeholder="arn:aws:s3:::my-bucket/*" />
+                </label>
+                <div className="lab-quick-row">
+                  {[...quickResources, '*'].map((r) => <button key={r} type="button" className="lab-quick" title={r} onClick={() => addTo('resources', r)}>{r === '*' ? '*' : r.split(':').pop()}</button>)}
                 </div>
-                <div className="lab-role-flow" aria-hidden="true">
-                  <span>Lambda</span><i>→</i><span>assumes role</span><i>→</i><span>policy</span>
-                </div>
-                <select
-                  value={roleInfo.policy ?? ''}
-                  onChange={(event) => attachPolicyToRole(roleName, event.target.value)}
-                  aria-label={`Policy for ${roleName}`}
-                >
-                  <option value="">No policy</option>
-                  {Object.keys(state.policies).map((policy) => <option key={policy} value={policy}>{policy}</option>)}
+                <label className="lab-check"><input type="checkbox" checked={pf.needsMfa} onChange={(e) => setPf({ ...pf, needsMfa: e.target.checked })} /> Only applies when the user signed in with MFA</label>
+                <button type="submit" className="btn lab-btn">Save policy</button>
+              </form>
+              <ul className="lab-list">
+                {sim.policies.map((p) => (
+                  <li key={p.name} className="lab-item">
+                    <div className="lab-item-head">
+                      <div className="lab-item-title"><code>{p.name}</code></div>
+                      <span className={`lab-tag ${p.effect === 'Allow' ? 'ok' : 'no'}`}>{p.effect}</span>
+                      <button type="button" className="btn lab-btn alt" onClick={() => setPf({ name: p.name, effect: p.effect, actions: p.actions.join(', '), resources: p.resources.join(', '), needsMfa: p.needsMfa })}>Edit</button>
+                      <button type="button" className="lab-del" aria-label={`Delete ${p.name}`} onClick={() => deletePolicy(p.name)}><Trash2 size={15} /></button>
+                    </div>
+                    <pre className="lab-pre">{JSON.stringify({ Effect: p.effect, Action: p.actions, Resource: p.resources, ...(p.needsMfa ? { Condition: { Bool: { 'aws:MultiFactorAuthPresent': 'true' } } } : {}) }, null, 2)}</pre>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {view === 'services' && (
+            <section className="lab-panel">
+              <p className="lab-kicker">IAM / services</p>
+              <h3>Services</h3>
+              <p className="lab-panel-desc">Create the resources your policies protect. Each one gets an ARN, the address policies use to point at it.</p>
+              <div className="lab-row">
+                <select value={sType} onChange={(e) => setSType(e.target.value as ServiceType)} aria-label="Service type">
+                  {(Object.keys(SERVICES) as ServiceType[]).map((t) => <option key={t} value={t}>{SERVICES[t].label}</option>)}
                 </select>
-                <div className="lab-policy-row">
-                  {roleInfo.policy
-                    ? <span className="lab-policy"><ShieldCheck size={11} />{roleInfo.policy}</span>
-                    : <span className="lab-empty">No policy attached</span>}
-                </div>
+                <input value={sName} onChange={(e) => setSName(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && createResource()} placeholder="e.g. reports-bucket" aria-label="Service name" />
+                <button type="button" className="btn lab-btn" onClick={createResource}>Create</button>
               </div>
-            ))}
-          </section>
+              <ul className="lab-list">
+                {sim.resources.map((r) => (
+                  <li key={keyOf(r)} className="lab-item">
+                    <div className="lab-item-head">
+                      <div className="lab-item-title"><strong>{r.name}</strong><small>{SERVICES[r.type].label}</small></div>
+                      <button type="button" className="lab-del" aria-label={`Delete ${r.name}`} onClick={() => mutate((s) => ({ ...s, resources: s.resources.filter((x) => keyOf(x) !== keyOf(r)) }))}><Trash2 size={15} /></button>
+                    </div>
+                    <code className="lab-arn">{arnOf(r)}</code>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
 
-          <section ref={simRef} className="lab-box lab-sim-box">
-            <div className="lab-box-head">
-              <span className="lab-box-num">04</span>
-              <div>
-                <p className="lab-box-kicker">Animated check</p>
-                <h3>Request tester</h3>
-              </div>
-              <span className="lab-sim-state on">Live</span>
-            </div>
-
-            <div className="lab-sim">
-                <div className="lab-sim-form">
-                  <label>
-                    Identity
-                    <select
-                      value={simPrincipal}
-                      onChange={(event) => { setSimPrincipal(event.target.value); resetFlow() }}
-                    >
-                      {state.users.map((user) => <option key={user} value={`user:${user}`}>IAM user · {user}</option>)}
-                      {Object.keys(state.roles).map((role) => <option key={role} value={`role:${role}`}>IAM role · {role}</option>)}
-                    </select>
-                  </label>
-                  <label>
-                    Action
-                    <input
-                      type="text"
-                      value={simAction}
-                      onChange={(event) => { setSimAction(event.target.value); resetFlow() }}
-                    />
-                  </label>
-                  <label>
-                    Resource ARN
-                    <input
-                      type="text"
-                      value={simResource}
-                      onChange={(event) => { setSimResource(event.target.value); resetFlow() }}
-                    />
-                  </label>
-                  <button type="button" className="btn lab-btn lab-run" onClick={runTest} disabled={running}>
-                    <Play size={13} aria-hidden="true" />
-                    {running ? 'Checking…' : 'Run request'}
-                  </button>
-                </div>
-
+          {view === 'test' && (
+            <section className="lab-panel">
+              <p className="lab-kicker">IAM / access request</p>
+              <h3>Request tester</h3>
+              <p className="lab-panel-desc">Choose who asks and what they want right inside the flow, then run it. An explicit Deny beats every Allow, and no match means no access.</p>
+              {!who || !target ? (
+                <p className="lab-empty">Create at least one user or role, and one service, to run a request.</p>
+              ) : (
                 <div className="lab-flow-panel">
-                  <div className="lab-flow-head">
-                    <span>Request flow</span>
-                    <span className={`lab-flow-status${tested ? tested.decision === 'ALLOW' ? ' ok' : ' no' : ''}`}>{flowStatus}</span>
+                  <div className="lab-scenarios">
+                    <div className="lab-tabs" role="group" aria-label="Example requests">
+                      {scenarios.map((sc, i) => (
+                        <button
+                          key={sc.title}
+                          type="button"
+                          className={`lab-tab${who === sc.who && keyOf(target) === sc.res && act === sc.action ? ' on' : ''}`}
+                          onClick={() => playScenario(sc)}
+                        >
+                          {i + 1} {sc.title}
+                        </button>
+                      ))}
+                    </div>
+                    <button type="button" className="btn lab-btn" onClick={runTest} disabled={running}>
+                      <Play size={13} aria-hidden="true" />{running ? 'Playing…' : 'Run request'}
+                    </button>
                   </div>
-                  <svg className="lab-flow-svg" viewBox="0 0 620 240" role="img" aria-label={`Request from ${simName} through IAM to the selected resource`}>
-                    <g className={`lab-flow-node${flowPhase !== 'idle' ? ' on' : ''}`}>
-                      <rect x="8" y="88" width="150" height="64" rx="9" />
-                      <text className="lab-node-kicker" x="83" y="110" textAnchor="middle">IDENTITY</text>
-                      <text className="lab-node-name" x="83" y="132" textAnchor="middle">{simLabel}</text>
-                    </g>
-                    <path className="lab-wire" d="M158 120 H240" />
-                    <g className={`lab-flow-node${flowPhase === 'iam' || flowPhase === 'result' ? ' on' : ''}`}>
-                      <rect x="240" y="78" width="130" height="84" rx="9" />
-                      <text className="lab-node-title" x="305" y="112" textAnchor="middle">IAM</text>
-                      <text className="lab-node-sub" x="305" y="130" textAnchor="middle">policy check</text>
-                    </g>
-                    {RESOURCES.map((resource) => (
-                      <path key={`wire-${resource.title}`} className="lab-wire" d={`M370 120 L440 ${resource.y + 28}`} />
-                    ))}
-                    {RESOURCES.map((resource, index) => {
-                      const isTarget = tested !== null && targetIndex === index
-                      return (
-                        <g key={resource.title} className={`lab-flow-node lab-resource${isTarget ? tested?.decision === 'ALLOW' ? ' ok' : ' no' : ''}`}>
-                          <rect x="440" y={resource.y} width="170" height="56" rx="9" />
-                          <text className="lab-node-res-title" x="525" y={resource.y + 23} textAnchor="middle">{resource.title}</text>
-                          <text className="lab-node-res-sub" x="525" y={resource.y + 39} textAnchor="middle">{resource.detail}</text>
-                          {isTarget && <text className={`lab-node-badge${tested?.decision === 'DENY' ? ' no' : ''}`} x="525" y={resource.y + 52} textAnchor="middle">{tested?.decision}</text>}
-                        </g>
-                      )
-                    })}
-                    <g
-                      className={`lab-packet${tested?.decision === 'DENY' ? ' no' : ''}`}
-                      style={{ transform: packetTransform, opacity: flowPhase === 'idle' ? 0 : 1 }}
-                    >
-                      <rect x="-60" y="-12" width="120" height="24" rx="6" />
-                      <text y="4" textAnchor="middle">{simAction.slice(0, 18)}</text>
-                    </g>
-                  </svg>
 
-                  {verdict ? (
-                    <div className={`lab-verdict ${verdict.decision === 'ALLOW' ? 'allow' : 'deny'}`} aria-live="polite">
+                  <div className="lab-diagram">
+                    <div className="lab-group">
+                      <strong>Practice account</strong>
+                      <small>identities</small>
+                      {identities.map((id) => (
+                        <button key={id} type="button" className={`lab-pick${id === who ? ' sel' : ''}`} aria-pressed={id === who} title={id.slice(5)} onClick={() => { setPrincipal(id); resetFlow() }}>
+                          {id.slice(5)}
+                          {id.startsWith('role:') && <small>role</small>}
+                        </button>
+                      ))}
+                      {who.startsWith('user:')
+                        ? <button type="button" className={`lab-tag lab-tag-btn ${mfaOn ? 'ok' : 'warn'}`} title="Click to switch MFA" onClick={() => patchUser(whoName, { mfa: !mfaOn })}>MFA {mfaOn ? 'on' : 'off'}</button>
+                        : <span className="lab-tag">Role session, no MFA</span>}
+                    </div>
+
+                    <div className={`lab-link${phase === 'identity' ? ' go' : phase === 'idle' ? '' : ' done'}`} aria-hidden="true"><i /></div>
+
+                    <div className={`lab-iam-box${phase === 'iam' ? ' busy' : ''}`}>
+                      <strong>IAM</strong>
+                      <small>policy check</small>
+                      <select className="lab-action" aria-label="Action" value={act} onChange={(e) => { setSimAction(e.target.value); resetFlow() }}>
+                        {actions.map((a) => <option key={a}>{a}</option>)}
+                      </select>
+                    </div>
+
+                    <div className="lab-fan" style={{ height: fanH }} aria-hidden="true">
+                      <svg viewBox={`0 0 100 ${fanH}`} preserveAspectRatio="none">
+                        {sim.resources.map((r, i) => (
+                          <path
+                            key={keyOf(r)}
+                            d={`M0 ${fanH / 2} L100 ${rowY(i)}`}
+                            vectorEffect="non-scaling-stroke"
+                            className={i === targetIdx ? `sel ${phase === 'result' ? verdictClass : ''}` : ''}
+                          />
+                        ))}
+                      </svg>
+                      {phase === 'result' && <i className={verdictClass} style={{ '--y': `${(rowY(targetIdx) / fanH) * 100}%` } as CSSProperties} />}
+                    </div>
+
+                    <div className="lab-targets">
+                      {sim.resources.map((r) => {
+                        const sel = keyOf(r) === keyOf(target)
+                        return (
+                          <button key={keyOf(r)} type="button" className={`lab-pick lab-target${sel ? ' sel' : ''}${sel && verdict ? ` ${verdictClass}` : ''}`} aria-pressed={sel} onClick={() => { setSimRes(keyOf(r)); resetFlow() }}>
+                            {SERVICES[r.type].label}
+                            <small>{r.name}</small>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                  <p className="lab-caption" aria-live="polite">{caption}</p>
+
+                    <ol className="lab-steps" aria-label="IAM decision workflow">
+                      {WORKFLOW.map((step, i) => {
+                        const st = run && i < revealed ? run.steps[i] : null
+                        return (
+                          <li key={step.title} className={`lab-step${st ? ` ${st.state}` : ''}${running && i === revealed - 1 ? ' current' : ''}`}>
+                            <span className="lab-step-mark" aria-hidden="true">
+                              {st ? (st.state === 'pass' ? <CheckCircle2 size={15} /> : st.state === 'stop' ? <X size={15} /> : <Minus size={15} />) : i + 1}
+                            </span>
+                            <div>
+                              <strong>{step.title}</strong>
+                              <p>{step.info}</p>
+                              {st && <p className="lab-step-result">{st.result}</p>}
+                            </div>
+                          </li>
+                        )
+                      })}
+                    </ol>
+
+                    <div className={`lab-verdict ${verdict ? (verdict.decision === 'ALLOW' ? 'allow' : 'deny') : 'idle'}`} aria-live="polite">
                       <ShieldCheck size={17} />
                       <div>
-                        <strong>{verdict.decision}</strong>
-                        <p>{verdict.reason}</p>
+                        <strong>{verdict ? verdict.decision : 'Ready'}</strong>
+                        <p>{verdict ? verdict.reason : 'Run the request to watch it travel through IAM.'}</p>
                       </div>
                     </div>
-                  ) : (
-                    <div className="lab-verdict idle">
-                      <Play size={15} />
-                      <div>
-                        <strong>Ready</strong>
-                        <p>Run the request to watch it travel through IAM.</p>
-                      </div>
-                    </div>
-                  )}
+
+                    {verdict && verdict.trace.length > 0 && (
+                      <table className="lab-trace">
+                        <thead><tr><th>Policy</th><th>From</th><th>Effect</th><th>Result</th></tr></thead>
+                        <tbody>
+                          {verdict.trace.map((t, i) => (
+                            <tr key={i} className={t.matched ? 'hit' : ''}>
+                              <td><code>{t.policy}</code></td><td>{t.source}</td><td>{t.effect}</td><td>{t.note}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    )}
                 </div>
-              </div>
-          </section>
+              )}
+            </section>
+          )}
         </div>
       </div>
 
-      {toast && (
-        <div className="lab-toast" role="status">
-          <CheckCircle2 size={15} /> {toast}
-        </div>
-      )}
-
-      {celebrate && (
-        <div className="lab-confetti" aria-hidden="true">
-          {confetti.map((piece, index) => (
-            <i
-              key={index}
-              style={{
-                '--x': `${piece.left}%`,
-                '--d': `${piece.delay}s`,
-                '--dur': `${piece.duration}s`,
-                '--c': piece.color,
-                '--r': `${piece.rotate}deg`,
-              } as CSSProperties}
-            />
-          ))}
-        </div>
-      )}
+      {toast && <div className="lab-toast" role="status"><CheckCircle2 size={15} /> {toast}</div>}
     </main>
   )
 }
